@@ -20,7 +20,9 @@ tgrep serve .            # start server (watches for file changes)
 tgrep "fn main" .        # instant — auto-connects to running server
 ```
 
-Using tgrep from an AI coding agent? See [AGENTS.md](AGENTS.md).
+Using tgrep from an AI coding agent? See [AGENTS.md](AGENTS.md), or serve the
+repository over the Model Context Protocol with `tgrep mcp .` — see
+[MCP.md](MCP.md).
 
 See [full benchmark results](BENCHMARKS.md) — up to **52x faster** than ripgrep on large repos.
 
@@ -423,6 +425,17 @@ With the default traversal rules, `--files` reads the live server or the local
 index instead of walking the repository. The local result is an index snapshot;
 use `--no-index` to inspect the filesystem as it exists now. Flags that change
 traversal membership or the file-size policy also fall back to a walk.
+
+### Serve to an AI agent (MCP)
+
+```bash
+tgrep mcp .                            # MCP server on stdio
+tgrep mcp . --no-auto-index            # never build or start a server
+```
+
+Exposes indexed search, per-file match counts, file listing, index state and
+folder snapshots/diffs as MCP tools, and starts a server for the repository
+unless one is already running. See [MCP.md](MCP.md).
 
 ### Check status
 

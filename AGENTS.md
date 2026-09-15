@@ -5,6 +5,12 @@ use `tgrep` as a fast search tool inside a repository. It complements the
 [README](README.md), which documents every flag; this file covers the few
 things an agent has to get right.
 
+If your client speaks the Model Context Protocol, `tgrep mcp /path/to/repo`
+serves the repository directly — search, file listing, match counts, index
+reporting and folder snapshots, with output budgets already set for a context
+window. See [MCP.md](MCP.md). The rest of this file is about driving the CLI
+yourself.
+
 ## The mental model
 
 tgrep is ripgrep with a pre-built trigram index and an optional server.
@@ -225,7 +231,9 @@ expected, and tgrep prints a warning saying so. Pass `--no-require-git` to
 
 ## Tool definition sketch
 
-If you expose tgrep to a model as a tool, a minimal schema is:
+`tgrep mcp` already does all of this, so reach for it first if your client can
+launch an MCP server ([MCP.md](MCP.md)). If you are wiring the CLI up yourself,
+a minimal schema is:
 
 ```json
 {
