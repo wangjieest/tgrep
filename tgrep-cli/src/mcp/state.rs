@@ -150,6 +150,25 @@ impl McpState {
         Ok(resolved)
     }
 
+    /// Wait for the index to become usable, up to `timeout`.
+    ///
+    /// Returns as soon as it is ready, or as soon as waiting is pointless
+    /// because no server is building one.
+    pub fn await_ready(&self, timeout: Duration) -> IndexStatus {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let status = self.index_status();
+            if !status.can_become_ready() {
+                return status;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return status;
+            }
+            std::thread::sleep(Duration::from_millis(250).min(deadline - now));
+        }
+    }
+
     /// What a query issued right now would actually read, and how fresh it is.
     pub fn index_status(&self) -> IndexStatus {
         let server = ServerInfo::load(&self.index_dir)
@@ -273,6 +292,25 @@ pub struct IndexStatus {
 }
 
 impl IndexStatus {
+    pub fn is_indexed(&self) -> bool {
+        self.readiness == IndexReadiness::Indexed
+    }
+
+    /// Whether waiting could turn this into an indexed query.
+    ///
+    /// True only while a server is working towards one. With no server there is
+    /// nothing to wait for, and scanning is the answer rather than a fallback.
+    pub fn can_become_ready(&self) -> bool {
+        !self.is_indexed() && self.origin != ServerOrigin::None
+    }
+
+    pub fn describe(&self) -> String {
+        match &self.note {
+            Some(note) => format!("{}: {note}", self.readiness.as_str()),
+            None => self.readiness.as_str().to_string(),
+        }
+    }
+
     /// The per-response summary every tool result carries, so a caller always
     /// knows whether it read an index or a filesystem scan.
     pub fn summary(&self) -> serde_json::Value {

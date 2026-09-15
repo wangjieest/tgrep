@@ -37,6 +37,12 @@ directly and the answer is correct but slow. Results reflect the index, which \
 tracks the filesystem asynchronously — a search issued immediately after an \
 edit may predate it.
 
+The first index of a large repository takes a minute or two. Until it exists, \
+a whole-repository content search reads every file and takes much longer than \
+waiting, so `search` and `count_matches` refuse one and say so. Open such a \
+session with `index_status {\"wait_seconds\": 120}`, or scope the query with \
+`path`.
+
 `snapshot_create` records the tree's metadata; `snapshot_diff` reports what has \
 changed since. Pass `hash: true` when creating one to enable content \
 verification and rename detection later.";
@@ -160,7 +166,7 @@ fn call_tool(params: &Value, state: &McpState) -> Value {
         "search" => query::search(state, &arguments),
         "search_files" => query::search_files(state, &arguments),
         "count_matches" => query::count_matches(state, &arguments),
-        "index_status" => index_status(state),
+        "index_status" => index_status(state, &arguments),
         "snapshot_create" => snapshot::create(state, &arguments),
         "snapshot_list" => snapshot::list(state, &arguments),
         "snapshot_diff" => snapshot::diff(state, &arguments),
@@ -181,8 +187,11 @@ fn call_tool(params: &Value, state: &McpState) -> Value {
     }
 }
 
-fn index_status(state: &McpState) -> Result<query::ToolOutput> {
-    let status = state.index_status();
+fn index_status(state: &McpState, args: &Value) -> Result<query::ToolOutput> {
+    let status = match args.get("wait_seconds") {
+        Some(_) => state.await_ready(query::wait_seconds(args)),
+        None => state.index_status(),
+    };
     let root = crate::search::display_path(&state.root);
     let index_dir = crate::search::display_path(&state.index_dir);
     let mut structured = status.summary();
@@ -241,6 +250,16 @@ fn scoping_properties() -> serde_json::Map<String, Value> {
         "hidden".into(),
         json!({ "type": "boolean", "default": false, "description": "Include hidden files and directories. Ignore rules still apply." }),
     );
+    properties.insert(
+        "wait_seconds".into(),
+        json!({
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 600,
+            "default": 3,
+            "description": "How long to wait for a building index before answering. Raise it on a large repository whose first index is still being built.",
+        }),
+    );
     properties
 }
 
@@ -266,6 +285,14 @@ fn matching_properties() -> serde_json::Map<String, Value> {
     properties.insert(
         "word".into(),
         json!({ "type": "boolean", "default": false, "description": "Match whole words only." }),
+    );
+    properties.insert(
+        "allow_scan".into(),
+        json!({
+            "type": "boolean",
+            "default": false,
+            "description": "Run a whole-repository scan even when the index is not ready. Refused by default: on a large tree that reads every file and takes far longer than waiting for the index.",
+        }),
     );
     properties
 }
@@ -355,8 +382,18 @@ fn tool_definitions() -> Vec<Value> {
             "index_status",
             "Index status",
             "Whether queries are answered from the index or by scanning, how far an initial \
-             build has got, and how the server is watching for changes.",
-            object_schema(serde_json::Map::new(), &[]),
+             build has got, and how the server is watching for changes. Pass wait_seconds to \
+             block until the index is ready — the right way to open a session on a large \
+             repository that has not been indexed before.",
+            object_schema(
+                [(
+                    "wait_seconds".to_string(),
+                    json!({ "type": "integer", "minimum": 0, "maximum": 600, "description": "Wait up to this long for the index to become ready. Returns early once it is, or once nothing is building it." }),
+                )]
+                .into_iter()
+                .collect(),
+                &[],
+            ),
         ),
         tool(
             "snapshot_create",

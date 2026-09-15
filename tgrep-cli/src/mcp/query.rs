@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
-use crate::mcp::state::McpState;
+use crate::mcp::state::{IndexStatus, McpState};
 use crate::output::{ColorMode, PathDisplay};
 use crate::search::{self, SearchOptions};
 
@@ -24,6 +24,11 @@ const MAX_MAX_RESULTS: usize = 1000;
 const DEFAULT_MAX_PER_FILE: usize = 10;
 /// Files listed in the `top_files` breakdown of a truncated result.
 const TOP_FILES: usize = 8;
+/// How long a content query waits for a building index before deciding what to
+/// do. Long enough that a small repository finishes indexing unnoticed, short
+/// enough not to look like a hang.
+const DEFAULT_WAIT_SECONDS: u64 = 3;
+const MAX_WAIT_SECONDS: u64 = 600;
 
 /// A `Write` sink whose bytes the caller can take back.
 #[derive(Clone, Default)]
@@ -133,6 +138,48 @@ fn apply_case(opts: &mut SearchOptions, args: &Value) -> Result<()> {
     Ok(())
 }
 
+pub fn wait_seconds(args: &Value) -> std::time::Duration {
+    let seconds = args
+        .get("wait_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_WAIT_SECONDS)
+        .min(MAX_WAIT_SECONDS);
+    std::time::Duration::from_secs(seconds)
+}
+
+/// Wait for the index, and refuse a whole-tree content scan rather than run one
+/// the caller did not ask for.
+///
+/// On a large repository the difference is not a matter of degree: building the
+/// index takes a minute or two, while a single unindexed query over the same
+/// tree reads every byte in it and can run for far longer than that. Answering
+/// "not yet, here is how to wait" is the useful reply; a query that never
+/// returns is not.
+fn ready_or_refuse(state: &McpState, scope: &Scope, args: &Value) -> Result<IndexStatus> {
+    let status = state.await_ready(wait_seconds(args));
+    match refusal(&status, scope.path == state.root, flag(args, "allow_scan")) {
+        Some(reason) => Err(anyhow::anyhow!(reason)),
+        None => Ok(status),
+    }
+}
+
+/// Why this query must not run, if it must not.
+///
+/// A named subdirectory is a scope the caller chose, and scanning it costs what
+/// that subtree costs rather than what the repository costs — so only a
+/// whole-tree query, against an index something is still building, is refused.
+fn refusal(status: &IndexStatus, whole_tree: bool, allow_scan: bool) -> Option<String> {
+    if status.is_indexed() || !status.can_become_ready() || !whole_tree || allow_scan {
+        return None;
+    }
+    Some(format!(
+        "the index is not ready ({}), and scanning the whole repository would read every file in it. \
+         Wait with index_status {{\"wait_seconds\": 60}}, narrow the query with `path`, \
+         or pass allow_scan=true to scan anyway.",
+        status.describe()
+    ))
+}
+
 /// Run one search and hand back everything the writer produced.
 fn capture(
     state: &McpState,
@@ -181,10 +228,10 @@ pub fn search(state: &McpState, args: &Value) -> Result<ToolOutput> {
     }
     apply_case(&mut opts, args)?;
 
+    let status = ready_or_refuse(state, &scope, args)?;
     let (raw, elapsed) = capture(state, &scope, &opts)?;
     let parsed = parse_events(&raw, max_results, context);
 
-    let status = state.index_status();
     let truncated = parsed.total_matches > parsed.hits.len() as u64;
     let mut structured = json!({
         "matches": parsed.hits.iter().map(Hit::to_json).collect::<Vec<_>>(),
@@ -243,6 +290,7 @@ pub fn count_matches(state: &McpState, args: &Value) -> Result<ToolOutput> {
     opts.field_match_separator = "\u{1}".to_string();
     apply_case(&mut opts, args)?;
 
+    let status = ready_or_refuse(state, &scope, args)?;
     let (raw, elapsed) = capture(state, &scope, &opts)?;
     let mut counts: Vec<(String, u64)> = raw
         .lines()
@@ -254,7 +302,6 @@ pub fn count_matches(state: &McpState, args: &Value) -> Result<ToolOutput> {
     let total: u64 = counts.iter().map(|(_, count)| count).sum();
     let files = counts.len();
     let shown: Vec<_> = counts.iter().take(max_files).collect();
-    let status = state.index_status();
 
     let mut text = String::new();
     for (path, count) in &shown {
@@ -296,6 +343,9 @@ pub fn search_files(state: &McpState, args: &Value) -> Result<ToolOutput> {
         .map(str::to_lowercase);
 
     let opts = base_options(state, &scope, args)?;
+    // Listing paths costs a walk rather than a read of every file, so it is
+    // never refused — but it still answers faster once the index is up.
+    let status = state.await_ready(wait_seconds(args));
     let sink = SharedSink::default();
     let mut writer = search::new_writer_to(&opts, Box::new(sink.clone()));
     let started = std::time::Instant::now();
@@ -313,7 +363,6 @@ pub fn search_files(state: &McpState, args: &Value) -> Result<ToolOutput> {
         })
         .collect();
     let shown: Vec<&&str> = all.iter().take(max_results).collect();
-    let status = state.index_status();
 
     let mut text: String = shown.iter().map(|path| format!("{path}\n")).collect();
     text.push_str(&format!(
@@ -556,4 +605,58 @@ fn render_matches(parsed: &Parsed, truncated: bool, status: &str) -> String {
         }
     ));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::state::{IndexReadiness, ServerOrigin};
+
+    fn status(readiness: IndexReadiness, origin: ServerOrigin) -> IndexStatus {
+        IndexStatus {
+            readiness,
+            origin,
+            note: None,
+            server: None,
+            index_updated_at: None,
+            server_error: None,
+        }
+    }
+
+    #[test]
+    fn a_whole_tree_scan_is_refused_only_while_an_index_is_coming() {
+        let building = status(IndexReadiness::Building, ServerOrigin::Embedded);
+        assert!(refusal(&building, true, false).is_some());
+
+        // The caller can still insist, or narrow the query themselves.
+        assert!(refusal(&building, true, true).is_none());
+        assert!(refusal(&building, false, false).is_none());
+
+        // Nothing is building an index here, so scanning is the answer rather
+        // than a fallback and refusing it would leave no way to search at all.
+        let unserved = status(IndexReadiness::Scanning, ServerOrigin::None);
+        assert!(refusal(&unserved, true, false).is_none());
+
+        let ready = status(IndexReadiness::Indexed, ServerOrigin::External);
+        assert!(refusal(&ready, true, false).is_none());
+    }
+
+    #[test]
+    fn the_refusal_names_every_way_out() {
+        let building = status(IndexReadiness::Building, ServerOrigin::Embedded);
+        let reason = refusal(&building, true, false).expect("refused");
+        assert!(reason.contains("index_status"), "{reason}");
+        assert!(reason.contains("path"), "{reason}");
+        assert!(reason.contains("allow_scan"), "{reason}");
+    }
+
+    #[test]
+    fn wait_defaults_are_bounded() {
+        assert_eq!(wait_seconds(&json!({})).as_secs(), DEFAULT_WAIT_SECONDS);
+        assert_eq!(wait_seconds(&json!({ "wait_seconds": 0 })).as_secs(), 0);
+        assert_eq!(
+            wait_seconds(&json!({ "wait_seconds": 100_000 })).as_secs(),
+            MAX_WAIT_SECONDS
+        );
+    }
 }
