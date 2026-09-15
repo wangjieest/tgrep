@@ -144,6 +144,32 @@ impl FileVersion {
         }
     }
 
+    /// Compact digest over every change-detection field this platform supplies,
+    /// for callers that only need equality between two observations.
+    ///
+    /// `None` when [`Self::is_trusted`] is false: an untrusted observation must
+    /// not be compared as if it were complete evidence.
+    pub fn evidence_digest(&self) -> Option<[u8; 16]> {
+        if !self.is_trusted() {
+            return None;
+        }
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&self.stamp.size.to_le_bytes());
+        hasher.update(&self.stamp.mtime.to_le_bytes());
+        hash_time(&mut hasher, self.modified);
+        hash_time(&mut hasher, self.created);
+        #[cfg(unix)]
+        {
+            hasher.update(&self.device.to_le_bytes());
+            hasher.update(&self.inode.to_le_bytes());
+            hasher.update(&self.change_seconds.to_le_bytes());
+            hasher.update(&self.change_nanos.to_le_bytes());
+        }
+        let mut digest = [0; 16];
+        digest.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+        Some(digest)
+    }
+
     fn persisted(&self) -> Option<PersistedVersion> {
         if !self.is_trusted() {
             return None;
@@ -165,6 +191,18 @@ impl FileVersion {
             unix: None,
         })
     }
+}
+
+/// Feed an optional timestamp into a digest, distinguishing absent from zero.
+fn hash_time(hasher: &mut blake3::Hasher, time: Option<SystemTime>) {
+    let Some(time) = time else {
+        hasher.update(&[0]);
+        return;
+    };
+    let time = VersionTime::from(time);
+    hasher.update(&[1, u8::from(time.before_epoch)]);
+    hasher.update(&time.seconds.to_le_bytes());
+    hasher.update(&time.nanos.to_le_bytes());
 }
 
 /// Derive precise metadata from an existing stat, without another filesystem
@@ -570,6 +608,43 @@ mod tests {
     }
 
     use super::*;
+
+    /// The digest has to see a change the whole-second stamp cannot, otherwise
+    /// snapshot diffing gains nothing from carrying it.
+    #[test]
+    fn evidence_digest_sees_a_same_size_rewrite_the_stamp_misses() {
+        // Start after a second boundary so both writes land in one second.
+        let subsec = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .subsec_millis();
+        if subsec > 500 {
+            std::thread::sleep(std::time::Duration::from_millis(
+                (1050 - subsec as u64).max(1),
+            ));
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("same-size.txt");
+        std::fs::write(&path, b"aaaa").unwrap();
+        let before = file_version(&std::fs::metadata(&path).unwrap());
+        // Longer than a Windows clock tick (~15.6ms), below which write times do not advance.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&path, b"bbbb").unwrap();
+        let after = file_version(&std::fs::metadata(&path).unwrap());
+
+        assert!(
+            before.is_trusted() && after.is_trusted(),
+            "this platform reports incomplete metadata, so the digest is unavailable"
+        );
+        assert_eq!(
+            before.stamp(),
+            after.stamp(),
+            "both writes must land in one second for this to test anything"
+        );
+        assert_ne!(before.evidence_digest(), after.evidence_digest());
+        assert!(before.evidence_digest().is_some());
+    }
 
     #[test]
     fn file_evidence_is_legacy_compatible_and_roundtrips_ids() {

@@ -45,10 +45,9 @@ pub struct ContextLine {
 const MATCH_COLOR: &str = "\x1b[1;31m";
 const COLOR_RESET: &str = "\x1b[0m";
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(test, derive(Default))]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum ColorMode {
-    #[cfg_attr(test, default)]
+    #[default]
     Auto,
     Always,
     Never,
@@ -229,7 +228,7 @@ fn floor_boundary(s: &str, i: usize) -> usize {
 
 pub struct OutputWriter {
     config: OutputConfig,
-    stdout: io::BufWriter<io::Stdout>,
+    stdout: io::BufWriter<Box<dyn Write + Send>>,
     current_file: Option<String>,
     use_color: bool,
     use_heading: bool,
@@ -264,7 +263,16 @@ pub struct OutputWriter {
 
 impl OutputWriter {
     pub fn new(config: OutputConfig) -> Self {
-        let is_tty = atty_check();
+        Self::build(config, Box::new(io::stdout()), atty_check())
+    }
+
+    /// Write through `sink` rather than stdout, for callers that consume the
+    /// rendered output in-process. A sink is never a terminal.
+    pub fn with_sink(config: OutputConfig, sink: Box<dyn Write + Send>) -> Self {
+        Self::build(config, sink, false)
+    }
+
+    fn build(config: OutputConfig, sink: Box<dyn Write + Send>, is_tty: bool) -> Self {
         let use_color = match config.color {
             ColorMode::Auto => is_tty,
             ColorMode::Always => true,
@@ -280,7 +288,7 @@ impl OutputWriter {
         };
         Self {
             config,
-            stdout: io::BufWriter::new(io::stdout()),
+            stdout: io::BufWriter::new(sink),
             current_file: None,
             use_color,
             use_heading,

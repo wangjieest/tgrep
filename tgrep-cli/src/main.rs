@@ -9,6 +9,7 @@ mod cpu;
 mod glob_filter;
 mod index;
 mod matching;
+mod mcp;
 mod mem;
 mod output;
 mod search;
@@ -690,6 +691,30 @@ enum Command {
         watcher_queue_cap: Option<u64>,
     },
 
+    /// Serve this repository over the Model Context Protocol (stdio).
+    Mcp {
+        /// Root directory to serve.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Answer only from an existing index or server; never start one.
+        #[arg(long)]
+        no_auto_index: bool,
+
+        /// Exclude directories from indexing (can be specified multiple times).
+        #[arg(long = "exclude", action = clap::ArgAction::Append)]
+        exclude: Vec<String>,
+
+        /// Maximum memory budget in megabytes for an index this server builds.
+        #[arg(long = "max-memory", value_name = "MB", value_parser = clap::value_parser!(u64).range(1..))]
+        max_memory_mb: Option<u64>,
+
+        /// Maximum CPU budget for an index this server builds, as a percentage
+        /// of logical cores (1-100).
+        #[arg(long = "max-cpu", value_name = "PERCENT")]
+        max_cpu_percent: Option<u8>,
+    },
+
     /// Search for a pattern.
     Search {
         /// The regex pattern to search for.
@@ -1107,6 +1132,7 @@ fn run_cli() {
     match &cli.command {
         Some(Command::Index { .. }) => reject_unsupported_discovery_flags(&cli, "index"),
         Some(Command::Serve { .. }) => reject_unsupported_discovery_flags(&cli, "serve"),
+        Some(Command::Mcp { .. }) => reject_unsupported_discovery_flags(&cli, "mcp"),
         _ => {}
     }
 
@@ -1179,6 +1205,30 @@ fn run_cli() {
         }) => {
             let (pattern, paths) = cli.split_pattern_and_paths(Some(pattern), paths);
             run_search(&cli, pattern, &paths, &resolved)
+        }
+        Some(Command::Mcp {
+            path,
+            no_auto_index,
+            exclude,
+            max_memory_mb,
+            max_cpu_percent,
+        }) => {
+            let memory_cap = max_memory_mb
+                .map(|mb| mb.saturating_mul(1024 * 1024))
+                .unwrap_or_else(mem::default_memory_cap_bytes);
+            mcp::run(
+                &path,
+                cli.index_path.as_deref(),
+                mcp::McpOptions {
+                    auto_index: !no_auto_index,
+                    exclude_dirs: exclude,
+                    no_ignore,
+                    no_require_git: cli.no_require_git,
+                    max_file_size: max_filesize,
+                    memory_cap_bytes: memory_cap,
+                    index_threads: cpu::index_thread_count(max_cpu_percent.unwrap_or(50)),
+                },
+            )
         }
         Some(Command::Status { path }) => status::run(&path, cli.index_path.as_deref()),
         Some(Command::CountFiles { path }) => walkcount::run(&path, cli.hidden, no_ignore),
@@ -1288,13 +1338,15 @@ fn list_files(
     opts: &search::SearchOptions,
 ) -> anyhow::Result<()> {
     let mut opts = opts.clone();
+    let mut writer = search::new_writer(&opts);
     for target in normalize_search_paths(paths) {
         if !target.path.exists() {
             report_missing_path(&target.path, opts.no_messages);
             continue;
         }
         opts.path_display = target.display();
-        search::list_files(&target.path, index_path, &opts)?;
+        writer.set_path_display(opts.path_display.clone());
+        search::list_files(&target.path, index_path, &opts, &mut writer)?;
     }
     Ok(())
 }

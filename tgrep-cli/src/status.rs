@@ -195,7 +195,15 @@ fn write_refresh_status(writer: &mut impl Write, status: &StatusResult) -> std::
 }
 
 fn query_server_status(info: &ServerInfo) -> Result<StatusResult> {
+    let status: StatusResult = serde_json::from_value(query_server_status_value(info)?)?;
+    Ok(status)
+}
+
+/// The server's `status` reply as it arrived, for callers that forward fields
+/// this build does not model.
+pub(crate) fn query_server_status_value(info: &ServerInfo) -> Result<serde_json::Value> {
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", info.port))?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
     let request = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "status",
@@ -208,12 +216,11 @@ fn query_server_status(info: &ServerInfo) -> Result<StatusResult> {
     let mut line = String::new();
     reader.read_line(&mut line)?;
 
-    let response: serde_json::Value = serde_json::from_str(&line)?;
-    let result = response
-        .get("result")
-        .ok_or_else(|| anyhow::anyhow!("no result in response"))?;
-    let status: StatusResult = serde_json::from_value(result.clone())?;
-    Ok(status)
+    let mut response: serde_json::Value = serde_json::from_str(&line)?;
+    response
+        .get_mut("result")
+        .map(serde_json::Value::take)
+        .ok_or_else(|| anyhow::anyhow!("no result in response"))
 }
 
 fn format_timestamp(ts: u64) -> String {

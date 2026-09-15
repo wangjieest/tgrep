@@ -19,8 +19,7 @@ use crate::matching::SearchMatcher;
 use crate::output::{ColorMode, ContextLine, Match, OutputConfig, OutputFormat, OutputWriter};
 use crate::serve::ServerInfo;
 
-#[derive(Clone)]
-#[cfg_attr(test, derive(Default))]
+#[derive(Clone, Default)]
 pub struct SearchOptions {
     pub pattern: String,
     pub extra_patterns: Vec<String>,
@@ -442,8 +441,18 @@ pub fn new_writer(opts: &SearchOptions) -> OutputWriter {
     OutputWriter::new(opts.make_output_config())
 }
 
+/// Build a writer that renders into `sink` instead of stdout.
+pub fn new_writer_to(opts: &SearchOptions, sink: Box<dyn std::io::Write + Send>) -> OutputWriter {
+    OutputWriter::with_sink(opts.make_output_config(), sink)
+}
+
 /// List files that would be searched (`--files` mode).
-pub fn list_files(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) -> Result<()> {
+pub fn list_files(
+    root: &Path,
+    index_path: Option<&Path>,
+    opts: &SearchOptions,
+    writer: &mut OutputWriter,
+) -> Result<()> {
     let start = Instant::now();
     let root = match std::fs::canonicalize(root) {
         Ok(root) => root,
@@ -457,7 +466,6 @@ pub fn list_files(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) 
         let rel_path = explicit_file_display_path(&root);
 
         if passes_filters(&rel_path, &glob_filter, &type_filter) {
-            let mut writer = OutputWriter::new(opts.make_output_config());
             writer.write_file(&rel_path)?;
             writer.flush()?;
         }
@@ -482,6 +490,7 @@ pub fn list_files(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) 
                 &glob_filter,
                 &type_filter,
                 opts,
+                writer,
             )?;
             if opts.stats {
                 eprintln!(
@@ -504,6 +513,7 @@ pub fn list_files(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) 
                         &glob_filter,
                         &type_filter,
                         opts,
+                        writer,
                     )?;
                     if opts.stats {
                         eprintln!(
@@ -547,6 +557,7 @@ pub fn list_files(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) 
         &glob_filter,
         &type_filter,
         opts,
+        writer,
     )?;
     if opts.stats {
         eprintln!(
@@ -621,6 +632,7 @@ fn write_indexed_file_paths(
     glob_filter: &crate::glob_filter::GlobFilter,
     type_filter: &filetypes::TypeFilter,
     opts: &SearchOptions,
+    writer: &mut OutputWriter,
 ) -> Result<()> {
     let mut seen = std::collections::HashSet::new();
     let mut paths: Vec<String> = paths
@@ -639,7 +651,6 @@ fn write_indexed_file_paths(
         sort.apply_indexed(&mut paths, index_root, scope, String::as_str);
     }
 
-    let mut writer = OutputWriter::new(opts.make_output_config());
     for path in paths {
         writer.write_file(&path)?;
     }
@@ -791,7 +802,7 @@ pub fn run(
 /// `std::fs::canonicalize` returns Windows extended-length paths (`\\?\C:\...`,
 /// or `\\?\UNC\server\share` for network paths). That prefix is an internal
 /// Win32 detail and only confuses people when it shows up in a diagnostic.
-fn display_path(p: &Path) -> String {
+pub(crate) fn display_path(p: &Path) -> String {
     strip_verbatim_prefix(&p.display().to_string())
 }
 
