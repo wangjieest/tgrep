@@ -1,7 +1,14 @@
 # tgrep
 
-Trigram-indexed grep with a client/server architecture for fast regex search
-in large codebases.
+Trigram-indexed grep with a client/server architecture for fast regex search in
+large codebases — as a command line tool, or as an MCP server that hands that
+search to an AI agent.
+
+> **This is a fork of [microsoft/tgrep](https://github.com/microsoft/tgrep).**
+> Its default branch adds one thing: `tgrep mcp`, a Model Context Protocol
+> server built for agents working in repositories too large to scan. Everything
+> else is upstream tgrep. See [what this fork adds](#what-this-fork-adds) and
+> **[MCP.md](MCP.md)**.
 
 **tgrep is integrated into [GitHub Copilot CLI](https://github.com/github/copilot-cli)
 to power fast grep searches across large repositories.**
@@ -20,9 +27,50 @@ tgrep serve .            # start server (watches for file changes)
 tgrep "fn main" .        # instant — auto-connects to running server
 ```
 
-Using tgrep from an AI coding agent? See [AGENTS.md](AGENTS.md), or serve the
-repository over the Model Context Protocol with `tgrep mcp .` — see
-[MCP.md](MCP.md).
+## What this fork adds
+
+`tgrep mcp <repo>` serves one repository over the Model Context Protocol on
+stdio. It starts a `tgrep serve` for the tree, or adopts one already running, so
+an agent gets indexed search without anyone managing a daemon — and the server
+it starts dies with it.
+
+```bash
+claude mcp add tgrep -- tgrep mcp /path/to/repo
+```
+
+| Tool | For |
+|------|-----|
+| `search` | Regex or literal search, with context lines |
+| `count_matches` | Per-file match counts — size a query before paying for its output |
+| `search_files` | Find files by path, glob or type |
+| `index_status` | Whether answers are indexed or scanned; wait for a build to finish |
+| `snapshot_create` / `snapshot_diff` | Record the tree's state, then report what changed since |
+
+Three things it does that wrapping the CLI in a tool definition does not:
+
+- **It budgets its output.** 60 matches by default, 10 per file, 512-byte lines
+  — and a truncated answer still reports the true totals plus where the rest of
+  the matches are, so narrowing the query is a decision rather than a guess.
+- **It says what answered.** Every result carries `index: {state, server}`:
+  `indexed`, `building` or `scanning`. An agent can tell a 200 ms indexed answer
+  from a filesystem scan, and knows how fresh either one is.
+- **It refuses the trap.** On a 371,547-file checkout, building the first index
+  took 97.6 s, while one whole-tree scan issued before that index existed ran
+  for over 12 minutes. Until the index is ready, a whole-repository content
+  search is refused with instructions for waiting instead of an answer that may
+  never arrive.
+
+Measured through the MCP tools on that same checkout once indexed: a literal
+symbol search across 540 files answers in 263 ms, per-file counts over 11,738
+files in 1.2 s, and a metadata snapshot of all 371,626 files in 2.2 s.
+
+Snapshots are the other half. `snapshot_create` records size, mtime and precise
+change evidence per file without reading any content; `snapshot_diff` then
+reports what was added, modified, deleted or renamed since — and with
+`hash: true` it can tell a file whose bytes really changed from one whose
+timestamp merely moved. Full semantics, costs and limits: [MCP.md](MCP.md).
+
+Driving the CLI from an agent instead? See [AGENTS.md](AGENTS.md).
 
 See [full benchmark results](BENCHMARKS.md) — up to **52x faster** than ripgrep on large repos.
 
