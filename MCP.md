@@ -224,8 +224,21 @@ Both directions are handled by recording content hashes:
 | `verify` | Behaviour |
 |----------|-----------|
 | `none` (default) | Metadata only. No file is read. |
-| `suspect` | Re-hash files flagged by metadata alone (not by a size change) and drop the ones whose content matches. |
-| `all` | Hash every file present in both observations. Catches the sub-tick rewrite metadata missed. |
+| `suspect` | Re-hash files flagged by metadata alone (not by a size change) and drop the ones whose content matches. Reports `hashed` and `cleared`. |
+| `all` | Hash every file present in both observations. Reports `compared`, `cleared`, and `content_only` — files that changed leaving *no* metadata trace, which is the case only `all` can find. |
+
+The two modes answer different questions, so they count different things.
+`suspect` asks "were these flagged files really changed?" and can only ever
+remove entries. `all` asks "what changed?" of every shared file, and can add
+entries metadata never flagged:
+
+```json
+"verification": {
+  "mode": "all", "available": true,
+  "compared": 2, "cleared": 1, "content_only": 0,
+  "note": "compared 2 files by content: 1 were flagged by metadata but identical, 0 changed with no metadata trace"
+}
+```
 
 Verification requires a base snapshot created with `hash: true`; there is
 nothing to compare today's bytes against otherwise. When it is unavailable the
