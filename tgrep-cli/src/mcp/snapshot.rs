@@ -527,25 +527,44 @@ pub fn diff(state: &McpState, args: &Value) -> Result<ToolOutput> {
     let mut added = Vec::new();
     let mut modified = Vec::new();
     let mut deleted = Vec::new();
+    let mut tally = ContentTally::default();
 
     for (path, entry) in target.files.iter().filter(|(path, _)| keep(path)) {
-        match base.files.get(path) {
-            None => added.push(Change {
+        let Some(previous) = base.files.get(path) else {
+            added.push(Change {
                 path: path.clone(),
                 size: entry.size,
                 previous_size: None,
                 evidence: Evidence::Size,
-            }),
-            Some(previous) => {
-                if let Some(evidence) = changed(previous, entry) {
-                    modified.push(Change {
-                        path: path.clone(),
-                        size: entry.size,
-                        previous_size: Some(previous.size),
-                        evidence,
-                    });
-                }
+            });
+            continue;
+        };
+        let mut record = |evidence| {
+            modified.push(Change {
+                path: path.clone(),
+                size: entry.size,
+                previous_size: Some(previous.size),
+                evidence,
+            })
+        };
+        let by_metadata = metadata_changed(previous, entry);
+        let Some(differs) = content_changed(previous, entry) else {
+            if let Some(evidence) = by_metadata {
+                record(evidence);
             }
+            continue;
+        };
+        tally.compared += 1;
+        match (by_metadata.is_some(), differs) {
+            // Metadata moved but the bytes did not: the change that was not one.
+            (true, false) => tally.cleared += 1,
+            // No metadata trace, yet the bytes differ. Only content sees this.
+            (false, true) => {
+                tally.content_only += 1;
+                record(Evidence::Content);
+            }
+            (true, true) => record(Evidence::Content),
+            (false, false) => {}
         }
     }
     for (path, entry) in base.files.iter().filter(|(path, _)| keep(path)) {
@@ -559,14 +578,14 @@ pub fn diff(state: &McpState, args: &Value) -> Result<ToolOutput> {
         }
     }
 
-    let verification = verify_changes(
-        state,
-        &base,
-        &target,
-        &mut modified,
-        &verify,
-        target_is_live,
-    )?;
+    // Content already decided every shared file when both observations carry
+    // hashes; re-deriving a count from what survived would describe a different
+    // comparison than the one that ran.
+    let verification = if tally.compared > 0 {
+        tally.report(&verify)
+    } else {
+        verify_changes(state, &base, &mut modified, &verify, target_is_live)?
+    };
     let renamed = if detect_renames {
         detect_renamed(state, &base, &mut added, &mut deleted, target_is_live)?
     } else {
@@ -622,13 +641,10 @@ pub fn diff(state: &McpState, args: &Value) -> Result<ToolOutput> {
     })
 }
 
-/// Whether two observations of the same path disagree, and on what grounds.
-fn changed(previous: &Entry, current: &Entry) -> Option<Evidence> {
+/// Whether two observations of the same path disagree on metadata alone.
+fn metadata_changed(previous: &Entry, current: &Entry) -> Option<Evidence> {
     if previous.size != current.size {
         return Some(Evidence::Size);
-    }
-    if let (Some(before), Some(after)) = (previous.hash, current.hash) {
-        return (before != after).then_some(Evidence::Content);
     }
     if let (Some(before), Some(after)) = (previous.digest, current.digest) {
         return (before != after).then_some(Evidence::Digest);
@@ -636,15 +652,56 @@ fn changed(previous: &Entry, current: &Entry) -> Option<Evidence> {
     (previous.mtime != current.mtime).then_some(Evidence::Mtime)
 }
 
+/// Whether the bytes differ, when both observations recorded a hash.
+fn content_changed(previous: &Entry, current: &Entry) -> Option<bool> {
+    match (previous.hash, current.hash) {
+        (Some(before), Some(after)) => Some(before != after),
+        _ => None,
+    }
+}
+
+/// What a content comparison actually did, counted as it happened.
+#[derive(Default)]
+struct ContentTally {
+    compared: usize,
+    /// Flagged by metadata, identical on disk.
+    cleared: usize,
+    /// Changed with no metadata trace at all.
+    content_only: usize,
+}
+
+impl ContentTally {
+    fn report(&self, verify: &str) -> Value {
+        let mut note = format!(
+            "compared {} files by content: {} were flagged by metadata but identical, \
+             {} changed with no metadata trace",
+            self.compared, self.cleared, self.content_only
+        );
+        if verify == "none" {
+            note.push_str(
+                " (both observations carry hashes, so content decided it regardless of verify)",
+            );
+        }
+        json!({
+            "mode": verify,
+            "available": true,
+            "compared": self.compared,
+            "cleared": self.cleared,
+            "content_only": self.content_only,
+            "note": note,
+        })
+    }
+}
+
 /// Re-check metadata-flagged changes against file content.
 ///
-/// Only a base snapshot that recorded content hashes can support this: without
-/// one there is nothing to compare today's bytes against, and saying so beats
-/// reporting an unverified answer as verified.
+/// Used when only the base observation carries hashes, so the comparison has to
+/// read today's bytes for the files metadata suspects. Without a hashed base
+/// there is nothing to compare against, and saying so beats reporting an
+/// unverified answer as verified.
 fn verify_changes(
     state: &McpState,
     base: &Snapshot,
-    target: &Snapshot,
     modified: &mut Vec<Change>,
     verify: &str,
     target_is_live: bool,
@@ -659,7 +716,7 @@ fn verify_changes(
             "note": "base snapshot holds no content hashes; create it with hash=true to verify",
         }));
     }
-    if !target_is_live && !target.has_hashes {
+    if !target_is_live {
         return Ok(json!({
             "mode": verify,
             "available": false,
@@ -680,14 +737,7 @@ fn verify_changes(
 
     let current: BTreeMap<String, [u8; 32]> = candidates
         .into_par_iter()
-        .filter_map(|path| {
-            let hash = if target_is_live {
-                hash_file(&state.root.join(&path)).ok()?
-            } else {
-                target.files.get(&path)?.hash?
-            };
-            Some((path, hash))
-        })
+        .filter_map(|path| Some((path.clone(), hash_file(&state.root.join(&path)).ok()?)))
         .collect();
 
     let before = modified.len();

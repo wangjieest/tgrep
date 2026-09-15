@@ -486,3 +486,76 @@ fn index_status_names_the_root_and_the_index_it_would_read() {
         "{structured}"
     );
 }
+
+#[test]
+fn verification_counts_what_it_actually_compared() {
+    let dir = fixture();
+    let mut session = Session::start(dir.path());
+    session.call("snapshot_create", json!({ "label": "base", "hash": true }));
+
+    // One real edit, and one rewrite of identical bytes that only moves
+    // metadata. A verified diff must report exactly one change and say that it
+    // cleared the other.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::write(
+        dir.path().join("src/main.rs"),
+        "fn main() { needle(); todo!() }\n",
+    )
+    .unwrap();
+    let untouched = dir.path().join("src/lib.rs");
+    let bytes = std::fs::read(&untouched).unwrap();
+    std::fs::write(&untouched, &bytes).unwrap();
+
+    for mode in ["suspect", "all"] {
+        let result = session.call("snapshot_diff", json!({ "base": "base", "verify": mode }));
+        let structured = &result["structuredContent"];
+        let verification = &structured["verification"];
+        assert_eq!(
+            structured["counts"]["modified"],
+            json!(1),
+            "{mode}: {structured}"
+        );
+        assert_eq!(structured["modified"][0]["path"], "src/main.rs", "{mode}");
+        assert_eq!(verification["available"], json!(true), "{mode}");
+        // The count has to describe the comparison that ran, not be re-derived
+        // from whatever survived it.
+        assert_eq!(verification["cleared"], json!(1), "{mode}: {verification}");
+    }
+}
+
+#[test]
+fn content_verification_finds_a_change_metadata_cannot_see() {
+    let dir = fixture();
+    let mut session = Session::start(dir.path());
+    session.call("snapshot_create", json!({ "label": "base", "hash": true }));
+
+    // Same byte count, and the modification time put back exactly as it was:
+    // every field a metadata comparison has to work with is unchanged. This is
+    // the sub-tick rewrite in slow motion.
+    let path = dir.path().join("src/lib.rs");
+    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[0] = b'P';
+    std::fs::write(&path, &bytes).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+
+    let blind = session.call("snapshot_diff", json!({ "base": "base" }));
+    assert_eq!(
+        blind["structuredContent"]["counts"]["modified"],
+        json!(0),
+        "metadata should be unable to see this: {}",
+        blind["structuredContent"]
+    );
+
+    let seen = session.call("snapshot_diff", json!({ "base": "base", "verify": "all" }));
+    let structured = &seen["structuredContent"];
+    assert_eq!(structured["counts"]["modified"], json!(1), "{structured}");
+    assert_eq!(structured["modified"][0]["path"], "src/lib.rs");
+    assert_eq!(structured["modified"][0]["evidence"], "content-hash");
+    assert_eq!(structured["verification"]["content_only"], json!(1));
+}
