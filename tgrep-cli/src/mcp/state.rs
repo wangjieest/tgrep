@@ -142,8 +142,12 @@ impl McpState {
         } else {
             self.root.join(requested)
         };
-        let resolved = std::fs::canonicalize(&joined)
-            .map_err(|e| anyhow::anyhow!("cannot open path `{requested}`: {e}"))?;
+        let resolved = std::fs::canonicalize(&joined).map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => {
+                anyhow::anyhow!("no such path `{requested}` under the server root")
+            }
+            _ => anyhow::anyhow!("cannot open path `{requested}`: {error}"),
+        })?;
         if !resolved.starts_with(&self.root) {
             bail!("path `{requested}` resolves outside the server root");
         }
